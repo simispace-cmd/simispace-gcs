@@ -49,7 +49,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QComboBox, QPushButton, QTextEdit,
     QSizePolicy, QDialog, QFormLayout,
-    QSpinBox, QDialogButtonBox, QMessageBox,
+    QSpinBox, QDialogButtonBox, QMessageBox, QDoubleSpinBox,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QPointF,
@@ -865,9 +865,8 @@ class MainWindow(QMainWindow):
         self._connected     = False
         self._worker        = None
         self._met_seconds   = 0
-        self._met_running   = False
-        self._alt_baseline  = None
-        self._alt_trigger   = 2.0        # metros para arrancar el MET
+        self._met_running   = False     # ahora se activa SOLO cuando T-minus llega a 0
+        self._met_started   = False     # evita re-disparar el arranque más de una vez
         self._packet_count  = 0
 
         # ── CSV logging ─────────────────────────────────────────────────────
@@ -875,12 +874,21 @@ class MainWindow(QMainWindow):
         self._csv_writer    = None
         self._csv_path      = None
 
+        # ── T-MINUS COUNTDOWN (independiente del MET) ─────────────────────────
+        self._tminus_seconds  = 48 * 3600   # default 48h, se actualiza desde el spinbox
+        self._tminus_running  = False
+
         self._build_ui()
 
         # MET timer (1 Hz, independiente del enlace)
         self._met_timer = QTimer(self)
         self._met_timer.timeout.connect(self._tick_met)
         self._met_timer.start(1000)
+
+        # T-MINUS timer (1 Hz, cuenta regresiva hacia el lanzamiento)
+        self._tminus_timer = QTimer(self)
+        self._tminus_timer.timeout.connect(self._tick_tminus)
+        self._tminus_timer.start(1000)
 
         QTimer.singleShot(0, self._open_connection_dialog)
 
@@ -896,6 +904,7 @@ class MainWindow(QMainWindow):
         ml.setSpacing(10)
 
         ml.addWidget(self._build_header())
+        ml.addWidget(self._build_tminus_bar())
 
         body = QWidget()
         bl = QGridLayout(body)
@@ -1055,6 +1064,98 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._btn_connect)
         return container
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # BARRA T-MINUS (cuenta regresiva de misión, independiente del MET)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Esta barra es un componente NUEVO, agregado entre el header y el body.
+    # No modifica ni depende de ningún widget existente. Permite configurar
+    # un T-menos editable (default 48h) y arrancarlo/detenerlo con un botón.
+
+    def _build_tminus_bar(self) -> QFrame:
+        container = QFrame()
+        container.setObjectName("TMinusBar")
+        container.setStyleSheet(f"""
+            #TMinusBar {{
+                background: {C['panel']};
+                border: 1px solid {C['border']};
+                border-radius: 8px;
+            }}
+        """)
+        container.setFixedHeight(56)
+
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(14)
+
+        lbl_title = QLabel("MISSION COUNTDOWN")
+        lbl_title.setStyleSheet(
+            f"color: {C['ink_dim']}; font-size: 10px; letter-spacing: 2px;")
+        layout.addWidget(lbl_title)
+
+        # Display grande del T-menos
+        self._lbl_tminus = QLabel(self._fmt_tminus())
+        self._lbl_tminus.setStyleSheet(
+            f"color: {C['accent']}; font-size: 22px; font-weight: bold;"
+            f" font-family: 'Courier New', monospace;")
+        layout.addWidget(self._lbl_tminus)
+
+        layout.addStretch()
+
+        # Campo editable de horas (default 48h)
+        lbl_hours = QLabel("HORAS:")
+        lbl_hours.setStyleSheet(f"color: {C['ink_dim']}; font-size: 11px;")
+        layout.addWidget(lbl_hours)
+
+        self._spin_tminus_hours = QDoubleSpinBox()
+        self._spin_tminus_hours.setRange(0.0, 999.0)
+        self._spin_tminus_hours.setDecimals(1)
+        self._spin_tminus_hours.setSingleStep(1.0)
+        self._spin_tminus_hours.setValue(48.0)
+        self._spin_tminus_hours.setSuffix(" h")
+        self._spin_tminus_hours.setFixedWidth(90)
+        self._spin_tminus_hours.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background: {C['panel_alt']}; color: {C['ink']};
+                border: 1px solid {C['border']}; border-radius: 4px;
+                padding: 4px 6px; font-size: 12px;
+            }}
+        """)
+        # Mientras no esté corriendo, editar las horas actualiza el display.
+        self._spin_tminus_hours.valueChanged.connect(self._on_tminus_hours_changed)
+        layout.addWidget(self._spin_tminus_hours)
+
+        # Botón START / PAUSE
+        self._btn_tminus = QPushButton("▶  START")
+        self._btn_tminus.setFixedHeight(34)
+        self._btn_tminus.setFixedWidth(110)
+        self._btn_tminus.setStyleSheet(f"""
+            QPushButton {{
+                background: {C['panel_alt']}; color: {C['green']};
+                border: 1px solid {C['border']}; border-radius: 4px;
+                font-size: 12px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {C['border']}; }}
+        """)
+        self._btn_tminus.clicked.connect(self._toggle_tminus)
+        layout.addWidget(self._btn_tminus)
+
+        # Botón RESET
+        btn_reset = QPushButton("RESET")
+        btn_reset.setFixedHeight(34)
+        btn_reset.setFixedWidth(80)
+        btn_reset.setStyleSheet(f"""
+            QPushButton {{
+                background: {C['panel_alt']}; color: {C['ink_dim']};
+                border: 1px solid {C['border']}; border-radius: 4px;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{ background: {C['border']}; }}
+        """)
+        btn_reset.clicked.connect(self._reset_tminus)
+        layout.addWidget(btn_reset)
+
+        return container
+
     def _build_camera_panel(self) -> QFrame:
         frame, body = self._make_panel("Onboard Camera Feed — Live")
 
@@ -1202,7 +1303,7 @@ class MainWindow(QMainWindow):
         # Reset estado de misión
         self._met_seconds  = 0
         self._met_running  = False
-        self._alt_baseline = None
+        self._met_started  = False
         self._packet_count = 0
         self._lbl_met.setText("00:00:00")
 
@@ -1347,25 +1448,11 @@ class MainWindow(QMainWindow):
             f"color: {master_col}; font-size: 14px; font-weight: bold; letter-spacing: 2px;")
         self._dot_status.setStyleSheet(f"color: {master_col}; font-size: 14px;")
 
-        # ── LÓGICA DEL MET ───────────────────────────────────────────────────
-        # El MET arranca cuando se detecta Δaltitud > alt_trigger metros.
-        # Una vez iniciado, sigue corriendo aunque la altitud baje.
-        if not self._met_running:
-            if self._alt_baseline is None:
-                self._alt_baseline = pkt.altitude
-                self._log.log(
-                    "INFO",
-                    f"Baseline de altitud: {pkt.altitude:.1f} m — "
-                    f"MET arrancará con Δ > {self._alt_trigger} m",
-                    "00:00:00")
-            else:
-                delta = pkt.altitude - self._alt_baseline
-                if delta >= self._alt_trigger:
-                    self._met_running = True
-                    self._log.log(
-                        "INFO",
-                        f"🚀 Despegue detectado! Δaltitud = {delta:.2f} m → MET iniciado",
-                        "00:00:00")
+        # Nota: el arranque del MET ya NO depende de la telemetría (altitud).
+        # Ahora se dispara automáticamente cuando el T-MINUS llega a 0,
+        # ver _tick_tminus(). Esto es más fiel a una operación real, donde
+        # el MET empieza en el instante de lanzamiento planeado (T-0),
+        # no cuando "se detecta" el despegue por sensor.
 
         # ── GRABAR EN CSV ────────────────────────────────────────────────────
         self._write_csv_row(pkt)
@@ -1382,6 +1469,106 @@ class MainWindow(QMainWindow):
     def _fmt_met(self) -> str:
         s = self._met_seconds
         return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # T-MINUS COUNTDOWN — lógica
+    # ─────────────────────────────────────────────────────────────────────────
+    # Independiente del MET, salvo por un único acoplamiento intencional:
+    # cuando el T-MINUS llega a 0 (T-0), el MET arranca automáticamente.
+    # Esto reemplaza la lógica anterior de "arrancar el MET por Δaltitud",
+    # que ya no se usa. El MET, una vez iniciado, NUNCA se pausa — así
+    # funciona en operaciones reales (es el tiempo transcurrido de misión).
+    #
+    # El T-MINUS sí se puede HOLD/RESUME en cualquier momento — eso modela
+    # un "hold" real de countdown (por ejemplo, ante un NO-GO de algún
+    # subsistema). Mientras está en HOLD, el reloj simplemente no avanza,
+    # y se reanuda exactamente donde se quedó.
+
+    def _tick_tminus(self):
+        if self._tminus_running and self._tminus_seconds > 0:
+            self._tminus_seconds -= 1
+            self._lbl_tminus.setText(self._fmt_tminus())
+            if self._tminus_seconds == 0:
+                self._tminus_running = False
+                self._btn_tminus.setText("▶  START")
+                self._log.log("WARN", "T-0 alcanzado — countdown finalizado",
+                              self._fmt_met())
+                self._start_met()   # ← único punto donde arranca el MET
+
+    def _fmt_tminus(self) -> str:
+        s = max(0, self._tminus_seconds)
+        sign = "-" if self._tminus_seconds > 0 else "+"
+        return f"T{sign}{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
+
+    def _on_tminus_hours_changed(self, value: float):
+        # Solo permite editar las horas mientras el countdown está detenido,
+        # para no desincronizar un countdown que ya está corriendo.
+        if not self._tminus_running:
+            self._tminus_seconds = int(value * 3600)
+            self._lbl_tminus.setText(self._fmt_tminus())
+
+    def _toggle_tminus(self):
+        if self._tminus_running:
+            # HOLD — equivalente a un "hold" real de countdown (NO-GO, etc.)
+            self._tminus_running = False
+            self._btn_tminus.setText("▶  RESUME")
+            self._btn_tminus.setStyleSheet(f"""
+                QPushButton {{
+                    background: {C['panel_alt']}; color: {C['amber']};
+                    border: 1px solid {C['amber']}; border-radius: 4px;
+                    font-size: 12px; font-weight: bold;
+                }}
+                QPushButton:hover {{ background: {C['border']}; }}
+            """)
+            self._log.log("WARN", f"⏸ HOLD — countdown detenido en {self._fmt_tminus()}",
+                          self._fmt_met())
+        else:
+            # Arrancar / reanudar — si está en 0, lo recarga desde el spinbox
+            if self._tminus_seconds <= 0:
+                self._tminus_seconds = int(self._spin_tminus_hours.value() * 3600)
+            self._tminus_running = True
+            self._btn_tminus.setText("⏸  HOLD")
+            self._btn_tminus.setStyleSheet(f"""
+                QPushButton {{
+                    background: {C['panel_alt']}; color: {C['green']};
+                    border: 1px solid {C['border']}; border-radius: 4px;
+                    font-size: 12px; font-weight: bold;
+                }}
+                QPushButton:hover {{ background: {C['border']}; }}
+            """)
+            self._log.log(
+                "INFO",
+                f"Countdown iniciado/reanudado: {self._fmt_tminus()}",
+                self._fmt_met())
+
+    def _reset_tminus(self):
+        self._tminus_running = False
+        self._tminus_seconds = int(self._spin_tminus_hours.value() * 3600)
+        self._lbl_tminus.setText(self._fmt_tminus())
+        self._btn_tminus.setText("▶  START")
+        self._btn_tminus.setStyleSheet(f"""
+            QPushButton {{
+                background: {C['panel_alt']}; color: {C['green']};
+                border: 1px solid {C['border']}; border-radius: 4px;
+                font-size: 12px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {C['border']}; }}
+        """)
+        self._log.log("INFO", "Countdown reiniciado", self._fmt_met())
+
+    def _start_met(self):
+        """
+        Arranca el MET. Se llama una única vez, automáticamente, cuando el
+        T-MINUS llega a T-0. El MET NO tiene botón de pausa: una vez que
+        empieza, corre de forma continua hasta el cierre de la sesión —
+        igual que el tiempo de misión en una operación real.
+        """
+        if not self._met_started:
+            self._met_started  = True
+            self._met_running  = True
+            self._met_seconds  = 0
+            self._log.log("INFO", "🚀 T-0 — MET iniciado automáticamente",
+                          "00:00:00")
 
     # ─────────────────────────────────────────────────────────────────────────
     # CIERRE
